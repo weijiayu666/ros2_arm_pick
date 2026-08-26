@@ -1,0 +1,7 @@
+# 读取当前真实关节角度服务
+# 请求 (无参数)
+---
+# 响应
+float64[] angles   # 6轴真实角度(弧度)
+bool success       # 是否读取成功
+string message     # 状态消息

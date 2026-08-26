@@ -1,0 +1,8 @@
+# 设置单个关节角度服务
+# 请求
+int32 joint_id    # 关节ID (0-5)
+float64 angle     # 目标角度(度)
+---
+# 响应
+bool success      # 是否成功
+string message    # 状态消息

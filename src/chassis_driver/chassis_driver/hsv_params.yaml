@@ -1,0 +1,9 @@
+dilate_iter: 0
+erode_iter: 0
+h_max: 16
+h_min: 0
+min_area: 1000
+s_max: 255
+s_min: 126
+v_max: 255
+v_min: 178

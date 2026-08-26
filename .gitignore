@@ -1,0 +1,18 @@
+# 编译产物 (ROS2 colcon)
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# 编辑器 / 临时文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

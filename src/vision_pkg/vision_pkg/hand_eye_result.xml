@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<opencv_storage>
+<R type_id="opencv-matrix">
+  <rows>3</rows>
+  <cols>3</cols>
+  <dt>d</dt>
+  <data>
+    0.0085056294854414464 0.0047618411942498698 0.99995248843907436
+    -0.038121942349261188 -0.99926016759675473 0.0050828108390002964
+    0.9992368947244572 -0.038163363622015778 -0.0083178061096545897</data></R>
+<t type_id="opencv-matrix">
+  <rows>3</rows>
+  <cols>1</cols>
+  <dt>d</dt>
+  <data>
+    0.050000000000000003 0.070000000000000007 0.029999999999999999</data></t>
+<method>LM_OPT_USER_T</method>
+<avg_error_mm>4.6817929513298058</avg_error_mm>
+<num_pairs>13</num_pairs>
+</opencv_storage>
