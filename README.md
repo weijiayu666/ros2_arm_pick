@@ -24,7 +24,7 @@
 | 部件 | 型号/说明 | 连接方式 |
 |---|---|---|
 | 主控 | 树莓派（aarch64，ROS2 Jazzy） | — |
-| 机械臂 | GenkiArm 5-DOF（5 个舵机 + 夹爪） | CH340 串口，by-path `usb-0:1.1`（`ttyUSB0`） |
+| 机械臂 | jibot 5-DOF（5 个舵机 + 夹爪） | CH340 串口，by-path `usb-0:1.1`（`ttyUSB0`） |
 | 底盘 | 差速轮（2 电机，BDC 驱动器） | CH340 串口，by-path `usb-0:1.3`（`ttyUSB1`） |
 | 相机 | USB 单目相机（640×480，安装于机械臂 `link4`） | USB（`ttyACM0` 视频接口） |
 
@@ -168,9 +168,8 @@ depth = BALL_DIAMETER × f_eq / pixel_diameter
 ### 5.4 逆运动学求解（`ik_solver.py`）
 
 - **结构**：5-DOF（q1~q5），末端定义为“两指中心 + 70 mm 沿末端 X 轴前伸 − 10 mm 沿末端 Z 轴”；
-- **算法**：RRT-Connect（迭代 1000 次）+ Jacobian 数值精修（200 步）；
-- **加速**：正运动学带 FK 缓存（`Tree` 保存各节点 3D 位置），求解成功立即返回；
-- **并发**：`ThreadPoolExecutor`（闭包函数，避免进程序列化开销）。
+- **算法**：解析法（纯几何法，`solve_ik_analytic`）——固定腕部滚转 q5，用 `atan2(y, x)` 几何解出 q1（臂平面转向目标），再对 q1~q4 做 Jacobian 阻尼最小二乘迭代收敛（≤200 步）；
+- **特点**：相比 RRT-Connect 快千倍以上，直接返回 `[q_start, q_solution]` 路径。
 
 ### 5.5 工作空间约束
 
