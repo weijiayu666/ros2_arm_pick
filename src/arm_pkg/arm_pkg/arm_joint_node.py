@@ -81,6 +81,7 @@ class ArmJointNode(Node):
         super().__init__('arm_joint_node')
 
         self.declare_parameter('serial_port', '/dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.1:1.0-port0')
+        self.declare_parameter('angle_read_rate', 2.0)  # 关节角实时读取频率 (Hz)
 
         # 当前角度值 (弧度) - 来自下位机 $GAA! 真实反馈
         self.current_angles = [0.0] * SERVO_NUM
@@ -115,8 +116,9 @@ class ArmJointNode(Node):
         # 定时发布 joint_msg (10Hz)
         self.timer = self.create_timer(0.1, self.timer_callback)
 
-        # 定时读取角度 (1Hz) - 降低频率避免干扰控制命令
-        self.read_timer = self.create_timer(1.0, self.read_angles_callback)
+        # 定时读取角度 (实时) - 供手眼变换/底盘逼近使用
+        read_rate = self.get_parameter('angle_read_rate').value
+        self.read_timer = self.create_timer(1.0 / read_rate, self.read_angles_callback)
 
         self.get_logger().info('Arm joint node has been started.')
 

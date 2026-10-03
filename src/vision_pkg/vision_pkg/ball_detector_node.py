@@ -20,6 +20,7 @@ import numpy as np
 import os
 import yaml
 import math
+import time
 
 
 # ── 默认参数 (校准文件不存在时使用) ──
@@ -55,6 +56,11 @@ BALL_RADIUS = BALL_DIAMETER / 2.0   # 球半径 2cm (表面中心 → 球心补�
 # 只有当新候选峰值比上一帧跟踪球大 TRACK_HYSTERESIS 倍时才切换目标, 避免识别框反复跳。
 TRACK_HYSTERESIS = 1.15
 
+# 连续性锁定参数 (image_callback 用): 多球时保持锁定目标, 防止机械臂逼近/转动时目标反复切换
+LOCK_RADIUS_RATIO = 1.5    # 锁定半径 = 上一帧球直径 × 此系数
+LOCK_RADIUS_MIN = 60.0     # 锁定半径下限 (px), 球较小时也保持足够关联范围
+LOCK_HOLD_TIME = 1.0       # 目标球暂时丢失(被遮挡/移出)后保持锁定的时间 (s)
+
 # 闭运算迭代次数: 先膨胀后腐蚀, 填补球 mask 的小缺口/裂缝
 # (球面反光/颜色不均导致分割缺块, 短轴内切圆半径会偏小, 框只圈住球的一部分)
 CLOSE_ITER = 1
@@ -75,7 +81,8 @@ class BallDetectorNode(Node):
         # 缓存 (像素检测持续更新, 3D解算仅在 /get_goal 时做)
         self._latest_frame = None    # 最新帧 (供 /get_goal 解算)
         self._latest_px = None       # 最新像素 (cx, cy)
-        self._tracked = None         # 上一帧锁定目标 (cx, cy, pixel_diameter), 防两球相近时识别框跳变
+        self._tracked = None         # 持久锁定目标 (cx, cy, pixel_diameter), 抓完当前球前不切换
+        self._tracked_lost_at = None  # 锁定目标丢失时刻 (monotonic), None=未丢失
 
         self.image_sub = self.create_subscription(
             Image, '/image_raw', self.image_callback,
@@ -165,6 +172,13 @@ class BallDetectorNode(Node):
 
         if not balls:
             self._latest_px = None
+            # 锁定目标短时丢失(抓取瞬间遮挡/单帧丢帧): 保持锁定, 超时才释放
+            if self._tracked is not None:
+                if self._tracked_lost_at is None:
+                    self._tracked_lost_at = time.monotonic()
+                elif time.monotonic() - self._tracked_lost_at > LOCK_HOLD_TIME:
+                    self._tracked = None
+                    self._tracked_lost_at = None
             # 无球时也发布哨兵, 让 arm_catch_node 知道检测节点已就绪, 否则永远不会触发无球扫描
             px_msg = Float32MultiArray()
             px_msg.data = [-1.0, -1.0, 0.0]
@@ -180,10 +194,36 @@ class BallDetectorNode(Node):
                 cv2.waitKey(1)
             return
 
-        # 最近球 = 直径最大的球 (列表首位)
-        cx, cy, pixel_diameter, bbox = balls[0]
+        # 持久锁定: 一旦锁定最近球, 持续追踪同一颗球直到被抓走, 不因其它球更近而切换
+        if self._tracked is not None:
+            lcx, lcy, ld = self._tracked
+            lock_radius = max(ld * LOCK_RADIUS_RATIO, LOCK_RADIUS_MIN)
+            best = None
+            best_d = float('inf')
+            for b in balls:
+                d = math.hypot(b[0] - lcx, b[1] - lcy)
+                if d < best_d:
+                    best_d = d
+                    best = b
+            if best is not None and best_d <= lock_radius:
+                # 锁定球仍在视野: 继续锁定并更新其最新位置/直径
+                target = best
+                self._tracked = (best[0], best[1], best[2])
+                self._tracked_lost_at = None
+            else:
+                # 锁定球已消失(被抓走): 释放锁定, 重新锁定当前最近的球
+                self._tracked = None
+                self._tracked_lost_at = None
+                target = balls[0]
+                self._tracked = (target[0], target[1], target[2])
+        else:
+            # 无锁定: 锁定当前最近球
+            target = balls[0]
+            self._tracked = (target[0], target[1], target[2])
+            self._tracked_lost_at = None
+
+        cx, cy, pixel_diameter, bbox = target
         self._latest_px = (cx, cy)
-        self._tracked = (cx, cy, pixel_diameter)  # 锁定本帧目标, 供下一帧迟滞防跳变
         bx, by, bw, bh = bbox
 
         # 发布所有球 (近→远): 每球 [cx, cy, diameter]
@@ -268,8 +308,14 @@ class BallDetectorNode(Node):
         if cv2.countNonZero(mask) == 0:
             return []
 
-        # 距离变换: 峰值定位前方球球心 (重叠球时全局最大峰值 = 前方球心)
-        dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+        # 先取外轮廓, 再把轮廓内部填实: 球面反光造成的内部空洞会被填平,
+        # 距离变换峰值就能回到真实球心, 而不是被空洞挤开。
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        mask_filled = np.zeros(mask.shape, np.uint8)
+        cv2.drawContours(mask_filled, contours, -1, 255, cv2.FILLED)
+
+        # 距离变换: 在填实后的 mask 上做, 峰值 = 最大内切圆圆心 = 前方球球心
+        dist = cv2.distanceTransform(mask_filled, cv2.DIST_L2, 5)
         _, max_val, _, max_loc = cv2.minMaxLoc(dist)
 
         cx = float(max_loc[0])
@@ -289,7 +335,6 @@ class BallDetectorNode(Node):
 
         # 找包含球心的轮廓, 用外接矩形内切圆半径 min(w,h)/2 作为球半径。
         # 比纯内切圆(距离变换峰值)圈得全, 比外接圆更抗噪点/斜椭圆。
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         balls = []
         nearest_contour = None
         radius = 0.0

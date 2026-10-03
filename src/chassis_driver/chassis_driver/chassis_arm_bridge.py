@@ -11,7 +11,7 @@
 import rclpy
 from rclpy.node import Node
 from chassis_msg.msg import ChassisCmd, ChassisState
-from std_msgs.msg import Float32MultiArray, String, Bool
+from std_msgs.msg import Float32MultiArray, String, Bool, Float32
 import time
 import math
 
@@ -38,7 +38,7 @@ MAX_ANGULAR = 0.50
 
 # ── 时序 ──
 SETTLE_TIME = 1.0         # 停下后等待稳定 (s)
-BALL_LOST_TIMEOUT = 0.3   # 球丢失容忍 (s)
+BALL_LOST_TIMEOUT = 0.5   # 球丢失容忍 (s)
 MOVE_MAX_TIME = 8.0       # 单步移动超时上限 (s)
 MAX_ITER = 12             # 二分逼近最大迭代次数
 
@@ -68,6 +68,7 @@ class ChassisArmBridge(Node):
         # 二分逼近状态
         self._iter = 0
         self._cur_linear = 0.0
+        self._cur_gear = 'slow'      # 当前挡位: 'fast' 快速挡 / 'slow' 慢速挡
         self._move_deadline = 0.0
         self._settle_deadline = 0.0
         self._y_target = Y_TARGET  # 当前逼近目标 y (根据球高度 z 动态调整)
@@ -84,6 +85,8 @@ class ChassisArmBridge(Node):
             ChassisState, '/chassis_state', self._chassis_state_cb, 10)
         self.back_off_sub = self.create_subscription(
             Bool, '/back_off', self._back_off_cb, 10)
+        self.back_off_dist_sub = self.create_subscription(
+            Float32, '/back_off_dist', self._back_off_dist_cb, 10)
 
         # ── 发布 ──
         self.chassis_cmd_pub = self.create_publisher(
@@ -140,14 +143,25 @@ class ChassisArmBridge(Node):
         self.chassis_online = True
 
     def _back_off_cb(self, msg: Bool):
-        """球太近 → 后退固定距离拉开间距"""
+        """球太近 → 后退固定距离 5cm"""
+        if msg.data:
+            self._back_off_by(BACK_OFF_DISTANCE)
+
+    def _back_off_dist_cb(self, msg: Float32):
+        """指定距离后退 (米)"""
+        self._back_off_by(abs(float(msg.data)))
+
+    def _back_off_by(self, dist: float):
+        """按指定距离后退"""
+        if dist <= 0:
+            return
         if self._state != 'IDLE':
             self.get_logger().warn(f'状态 {self._state}, 忽略后退请求')
             return
-        self.get_logger().info('收到后退请求, 后退 5cm')
+        self.get_logger().info(f'收到后退请求, 后退 {dist * 100:.0f}cm')
         self.set_busy(True)
         self._cur_linear = -BACK_OFF_SPEED
-        self._move_deadline = time.time() + BACK_OFF_DISTANCE / BACK_OFF_SPEED
+        self._move_deadline = time.time() + dist / BACK_OFF_SPEED
         self._state = 'BACK_OFF'
         self.send_chassis_cmd(self._cur_linear, 0.0)
 
@@ -225,6 +239,7 @@ class ChassisArmBridge(Node):
         speed = FAST_LINEAR if abs(err) > GEAR_SWITCH else SLOW_LINEAR
         direction = 1.0 if err > 0 else -1.0
         self._cur_linear = direction * speed
+        self._cur_gear = 'fast' if abs(err) > GEAR_SWITCH else 'slow'
         duration = min(abs(distance) / speed, MOVE_MAX_TIME)
 
         self._iter += 1
@@ -242,7 +257,35 @@ class ChassisArmBridge(Node):
         self.send_chassis_cmd(self._cur_linear, 0.0)
 
     def _do_move_y(self):
-        """走固定半程, 靠计时, 不看球"""
+        """走半程: 实时球坐标提前停止 (分挡位) + 球丢失立刻停 + 计时兜底"""
+        # 球检测不到 → 立刻停止前进 (不再继续盲走), 进入稳定重测(丢失则触发扫描)
+        if not self._ball_fresh():
+            self.get_logger().warn('前进中球丢失, 立刻停止')
+            self.stop_chassis()
+            self._settle_deadline = time.time() + SETTLE_TIME
+            self._state = 'SETTLE'
+            return
+
+        # 球新鲜 → 分挡位实时提前停
+        if self._cur_gear == 'fast':
+            # 快速挡: 球进入慢速区间 → 提前停, 下一轮切慢速挡
+            err = self._ball_pos[1] - self._y_target
+            if abs(err) <= GEAR_SWITCH:
+                self.get_logger().info('快速挡: 球已进入慢速区间, 提前停止切换慢速挡')
+                self.stop_chassis()
+                self._settle_deadline = time.time() + SETTLE_TIME
+                self._state = 'SETTLE'
+                return
+        else:
+            # 慢速挡: 球进入可达范围 → 提前停
+            if self._in_work_range():
+                self.get_logger().info('慢速挡: 球已进入可达范围, 提前停止')
+                self.stop_chassis()
+                self._settle_deadline = time.time() + SETTLE_TIME
+                self._state = 'SETTLE'
+                return
+
+        # 计时上限兜底 (走完计划半程就停)
         if time.time() >= self._move_deadline:
             self.stop_chassis()
             self._settle_deadline = time.time() + SETTLE_TIME

@@ -9,12 +9,19 @@ import rclpy
 from rclpy.node import Node
 from target_msg.srv import GetGoal
 from arm_msg.msg import ArmJointAngles
-from std_msgs.msg import Float32MultiArray, String, Bool
+from std_msgs.msg import Float32MultiArray, String, Bool, Float32
 from arm_pkg.ik_solver import solve_ik_analytic
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import math
 import time
+
+# 蜂鸣器 (结束标志), 非树莓派环境时禁用
+try:
+    import RPi.GPIO as GPIO
+    _HAS_GPIO = True
+except Exception:
+    _HAS_GPIO = False
 
 
 # 工作空间 (米) - 半球形约束 (抓高处物体)
@@ -24,7 +31,7 @@ WORKSPACE = {
     'z_center': 0.056,  # joint1 高度 (半球球心, base_link 上方 5.6cm)
     'reach': 0.34,      # 臂长半径 (水平最远 34cm)
     'z_min': -0.11,     # 高度下限 (机械臂最低可达约 -11cm)
-    'z_max': 0.36,      # 抓高处物体: 高度上限 (竖直最高 41cm 留 5cm 余量)
+    'z_max': 0.38,      # 抓高处物体: 高度上限 (竖直最高 41cm 留 3cm 余量)
 }
 
 # 关节限位 (度)
@@ -73,27 +80,51 @@ MOTION_SOLVE  = 1500   # IK求解后移动: 中速
 MOTION_PLACE  = 2000   # 归位: 慢速平滑
 MOTION_RESET  = 2000   # 归位: 慢速平滑
 
-# 扫描参数 (0轴粗调找球)
+# 腕部(轴5/joint5, index4)左右转 90°: 抓取合爪后执行, 从当前位→-90°→+90°→0°(绝对角度)
+SHAKE_ANGLES = [-90.0, 90.0, 0.0]
+MOTION_SHAKE = 500  # 轴5 单次转动运动时间 (ms)
+
+# 扫描参数 (光栅扫描找球)
 SWEEP_STEP_DEG = 8.0    # 扫描步进 (°)
 SWEEP_INTERVAL = 0.15   # 扫描步进间隔 (s)
 SWEEP_MIN = -90.0
 SWEEP_MAX = 90.0
 
-# 底盘调整期间跟踪 (方案A): 0轴+2轴小幅度微调, 保持球在画面中间
-TRACK_GAIN = 0.04       # 跟踪增益 (°/px)
+# 光栅扫描线: (0轴起始角度, 关节2角度), 依次扫描 4 条线找球
+# 第1趟 0轴-90→+90 关节2=-25°; 第2趟 0轴+90→-90 关节2=-3°
+# 第3趟 0轴-90→+90 关节2=20°; 第4趟 0轴+90→-90 关节2=50°
+RASTER_LINES = [
+    (-90.0, -25.0),
+    (90.0,  -3.0),
+    (-90.0, 20.0),
+    (90.0,  50.0),
+]
 
-# 球太近判定: 像素面积超过此值视为面积过大(太近), 请求底盘后退 (25000px^2 ≈ 直径178px ≈ 球距离约10cm)
-TOO_CLOSE_AREA = 25000.0
+# 无效目标(工作范围外等无法调整)恢复扫描后短暂忽略球检测 (秒): 让机械臂转过该目标
+INVALID_RESUME_IGNORE = 3.0
+
+# 光栅扫描 4 条线都无结果 → 底盘倒退距离 (米)
+FINISH_BACK_OFF = 0.20
+
+# 等待底盘倒退完成的超时 (秒): 超过此时间即使底盘未响应也鸣响结束
+FINISH_TIMEOUT = 5.0
+
+# 蜂鸣器 (系统工作结束标志)
+BEEP_PIN = 21
+BEEP_TIMES = 3
+BEEP_ON_S = 0.2   # 每次鸣响时长 (s)
+BEEP_OFF_S = 0.2  # 每次鸣响间隔 (s)
+
+# 底盘调整期间跟踪 (方案A): 0轴+2轴微调, 保持球在画面中间
+# 增益需匹配底盘转弯角速度 (MAX_ANGULAR=0.5rad/s≈28.6°/s): 偏移30px时跟踪角速度≈30°/s
+TRACK_GAIN = 0.10       # 跟踪增益 (°/px)
+TRACK_THRESHOLD = 20    # 跟踪死区 (px), 比居中阈值更小, 转弯时更早响应
+
+# 球太近判定: 像素面积超过此值视为面积过大(太近), 请求底盘后退 (35000px^2 ≈ 直径211px)
+TOO_CLOSE_AREA = 35000.0
 
 # 后退请求冷却 (秒): 防止底盘桥接未就绪时每 0.5s 反复刷请求
 BACK_OFF_COOLDOWN = 2.0
-
-# 抓取目标 z 轴分段补偿 (米): 按识别出的 base z 坐标分段, 只加在 IK 目标上, 不影响工作范围判断
-Z_COMP_FAR  = 0.007   # z > 30cm 时补偿 0.7cm
-Z_COMP_DEEP = 0.007   # 20cm < z <= 30cm 时补偿 0.7cm
-Z_COMP_MID  = 0.015   # 15cm <= z <= 20cm 时补偿 1.5cm
-Z_COMP_NEAR = 0.020   # z < 15cm 时补偿 2cm
-
 
 class ArmCatchNode(Node):
     def __init__(self):
@@ -115,6 +146,7 @@ class ArmCatchNode(Node):
         self._motor_deadline = 0.0   # 电机运动完成时间, 此前的帧都是运动中途的
         self._state_start_time = time.time()  # 进入当前状态的时间 (启动即进入归位, 立即计时)
         self._cmd_sent = False       # 当前阶段指令是否已发送
+        self._shake_step = 0         # 轴5(joint5, index4) 左右转 90° 当前步骤索引
         self._ik_busy = False        # IK 计算中, 防止状态机重入
         self._manual_move = False    # 手动目标模式: 只移动到目标位, 不抓取
         self._last_back_off = 0.0    # 上次请求后退时间 (防抖)
@@ -127,18 +159,28 @@ class ArmCatchNode(Node):
         self.fail_target_pub = self.create_publisher(
             Float32MultiArray, '/ik_fail_target', 10)
         self.back_off_pub = self.create_publisher(Bool, '/back_off', 10)
+        self.back_off_dist_pub = self.create_publisher(
+            Float32, '/back_off_dist', 10)
         self.chassis_busy_sub = self.create_subscription(
             Bool, '/chassis_busy', self._chassis_busy_cb, 10)
 
         # /get_goal 服务客户端 (复用, 避免每次求解都重建)
         self.goal_client = self.create_client(GetGoal, '/get_goal')
 
-        # 扫描状态
-        self._sweep_angle = 0.0
-        self._sweep_dir = 1
-        self._sweep_last_step = 0.0
-        self._sweep_base_angles = [0.0] * 5  # 扫锚时保持其他关节的基准角度
+        # 扫描状态 (光栅扫描)
+        self._sweep_angle = 0.0      # 当前 0 轴角度
+        self._sweep_dir = 1          # 当前扫描方向
+        self._sweep_last_step = 0.0  # 上次步进时间
+        self._sweep_base_angles = [0.0, 0.0, -3.0, -91.0, 0.0]  # 扫描时其他关节的基准角度 (关节2 由扫描线决定)
+        self._sweep_line = 0         # 当前扫描线索引 (0~3)
+        self._sweep_target = 0.0     # 当前扫描线的 0 轴目标角度
+        self._sweep_joint2 = 0.0     # 当前扫描线的关节 2 角度
+        self._sweep_ignore_until = 0.0  # 恢复扫描后短暂忽略球检测(让机械臂离开无效目标)
         self._idle_no_ball_time = 0.0  # IDLE 中无球计时
+
+        # 结束流程 (扫描失败 → 归位+倒退 → 蜂鸣)
+        self._finish_start_time = 0.0   # 进入结束流程的时间
+        self._finish_busy_seen = False  # 是否观察到过底盘在倒退
 
         # IK 线程池: 并行跑两条策略
         self._ik_executor = ThreadPoolExecutor(max_workers=2)
@@ -163,6 +205,17 @@ class ArmCatchNode(Node):
 
         # 定时器: 驱动居中 → IK 状态机
         self.timer = self.create_timer(0.5, self.state_machine_callback)
+
+        # 蜂鸣器 (系统工作结束标志)
+        self._beep_ok = False
+        if _HAS_GPIO:
+            try:
+                GPIO.setmode(GPIO.BCM)
+                GPIO.setwarnings(False)
+                GPIO.setup(BEEP_PIN, GPIO.OUT, initial=0)
+                self._beep_ok = True
+            except Exception as e:
+                self.get_logger().warn(f'蜂鸣器初始化失败: {e}')
 
         self.get_logger().info('Arm catch node started (auto mode). Waiting for ball...')
 
@@ -207,14 +260,15 @@ class ArmCatchNode(Node):
         return z_lo <= z <= z_hi
 
     def _apply_z_comp(self, z_base: float) -> float:
-        """抓取目标 z 分段补偿 (只用于 IK 目标, 不用于工作范围判断)"""
-        if z_base > 0.30:
-            return z_base + Z_COMP_FAR
-        if z_base > 0.20:
-            return z_base + Z_COMP_DEEP
-        if z_base >= 0.15:
-            return z_base + Z_COMP_MID
-        return z_base + Z_COMP_NEAR
+        """抓取目标 z 分段补偿 (按 cm 分段, 向下补偿), 只用于 IK 目标, 不影响工作范围判断"""
+        z_cm = z_base * 100.0
+        if z_cm < 15.0:
+            comp_cm = 1.4
+        elif z_cm < 20.0:
+            comp_cm = 2.0
+        else:
+            comp_cm = 2.3
+        return z_base - comp_cm / 100.0
 
     def _fail(self, reason: str):
         """统一的失败处理: 回到 IDLE + 通知底盘桥接"""
@@ -245,6 +299,8 @@ class ArmCatchNode(Node):
             self._do_grasping()
         elif self._state == 'GRASPING_WAIT':
             self._do_grasping_wait()
+        elif self._state == 'SHAKING':
+            self._do_shaking()
         elif self._state == 'PLACING':
             self._do_placing()
         elif self._state == 'OPENING':
@@ -257,6 +313,10 @@ class ArmCatchNode(Node):
             self._do_tracking()
         elif self._state == 'MANUAL_MOVE':
             self._do_manual_move()
+        elif self._state == 'FINISHING':
+            self._do_finishing()
+        elif self._state == 'FINISHED':
+            pass  # 系统工作结束, 不再做任何动作
 
         # 每次状态机触发时发布当前状态, 供底盘桥接监控
         self._publish_status()
@@ -316,7 +376,7 @@ class ArmCatchNode(Node):
             return
         if self._idle_no_ball_time == 0.0:
             self._idle_no_ball_time = time.time()
-        elif time.time() - self._idle_no_ball_time > 3.0:
+        elif time.time() - self._idle_no_ball_time > 5.0:
             self._enter_sweeping('无球超时')
 
     def _request_back_off(self):
@@ -334,14 +394,34 @@ class ArmCatchNode(Node):
         self.back_off_pub.publish(msg)
 
     def _enter_sweeping(self, reason: str):
-        """进入扫描状态, 只动 0 轴, 其他关节固定为居中姿态"""
-        self.get_logger().info(f'=== {reason}, 启动 0轴扫描找球 ===')
+        """进入光栅扫描状态: 4 条扫描线依次扫, 只动 0 轴 + 关节2"""
+        self.get_logger().info(f'=== {reason}, 启动光栅扫描找球 ===')
         self._state = 'SWEEPING'
-        self._sweep_angle = SWEEP_MIN
-        self._sweep_dir = 1
-        self._sweep_last_step = 0.0
+        self._sweep_line = 0
         self._idle_no_ball_time = 0.0
-        self._sweep_base_angles = [0.0, 0.0, -3.0, -91.0, 0.0]
+        self._sweep_ignore_until = 0.0  # 清除残留的忽略窗口, 正常扫描立即检测球
+        self._sweep_base_angles = [0.0, 0.0, -3.0, -91.0, 0.0]  # 关节2 由扫描线决定
+        self._start_sweep_line()
+
+    def _start_sweep_line(self):
+        """开始当前扫描线: 设置 0 轴起始/目标角度和关节 2 角度, 并立即发送起始姿态"""
+        start_ang, joint2 = RASTER_LINES[self._sweep_line]
+        self._sweep_angle = start_ang
+        self._sweep_joint2 = joint2
+        self._sweep_dir = 1 if start_ang < 0 else -1
+        self._sweep_target = SWEEP_MAX if start_ang < 0 else SWEEP_MIN
+        self._sweep_last_step = 0.0
+        self.get_logger().info(
+            f'扫描第 {self._sweep_line + 1}/{len(RASTER_LINES)} 条线: '
+            f'0轴 {start_ang:.0f}°→{self._sweep_target:.0f}°, 关节2={joint2:.0f}°')
+        # 立即发送起始姿态, 让 0轴/关节2 先到位再步进 (否则扫描开始后仍停留归位姿态 0轴=0 关节2=-3)
+        ang = list(self._sweep_base_angles)
+        ang[0] = self._sweep_angle
+        ang[2] = self._sweep_joint2
+        cmd = ArmJointAngles()
+        cmd.angles = [math.radians(a) for a in ang] + [self.current_angles[5]]
+        cmd.motion_time_ms = MOTION_CENTER
+        self.cmd_pub.publish(cmd)
 
     def _do_centering(self):
         """居中阶段: 连续追踪, 等电机完成+新帧到达后才做下一次调整"""
@@ -456,20 +536,20 @@ class ArmCatchNode(Node):
         dx = cx - 313.9   # 光心 CX
         dy = cy - 232.6   # 光心 CY
 
-        # 已居中 → 无需调整
-        if abs(dx) <= CENTER_THRESHOLD and abs(dy) <= CENTER_THRESHOLD:
+        # 死区内 → 无需调整 (转弯/行进时用更小死区, 更早响应)
+        if abs(dx) <= TRACK_THRESHOLD and abs(dy) <= TRACK_THRESHOLD:
             return
 
-        # 小幅度微调 (0轴控制水平, 2轴控制俯仰)
+        # 微调 (0轴控制水平, 2轴控制俯仰), 步幅无上限, 由增益决定速度
         step0 = 0.0
         step2 = 0.0
-        if dx < -CENTER_THRESHOLD:
+        if dx < -TRACK_THRESHOLD:
             step0 = abs(dx) * TRACK_GAIN
-        elif dx > CENTER_THRESHOLD:
+        elif dx > TRACK_THRESHOLD:
             step0 = -abs(dx) * TRACK_GAIN
-        if dy < -CENTER_THRESHOLD:
+        if dy < -TRACK_THRESHOLD:
             step2 = -abs(dy) * TRACK_GAIN
-        elif dy > CENTER_THRESHOLD:
+        elif dy > TRACK_THRESHOLD:
             step2 = abs(dy) * TRACK_GAIN
 
         ang = [math.degrees(a) for a in self.current_angles[:5]]
@@ -486,15 +566,18 @@ class ArmCatchNode(Node):
             f'跟踪: dx={dx:.0f} dy={dy:.0f}px → 0轴{step0:+.1f}° 2轴{step2:+.1f}°'
         )
 
-    # ── 扫描: 0轴 -90°→90° 找球 ──
+    # ── 光栅扫描: 4 条线找球 ──
 
     def _do_sweeping(self):
-        """0轴快速扫描, 直到识别出小球"""
+        """光栅扫描: 每条线 0 轴从起始扫到目标, 关节2 固定为该线角度"""
         now = time.time()
 
-        # 检测到球 → 停止扫描, 进入居中
-        if self._ball_data is not None and time.time() - self._ball_data[2] < 0.3:
-            self.get_logger().info(f'扫描中检测到球! 当前角度 {self._sweep_angle:.0f}°')
+        # 检测到球 → 停止扫描, 进入居中 (恢复扫描后短暂忽略, 让机械臂先离开无效目标)
+        if self._ball_data is not None and time.time() - self._ball_data[2] < 0.3 \
+                and time.time() >= self._sweep_ignore_until:
+            self.get_logger().info(
+                f'扫描中检测到球! 0轴={self._sweep_angle:.0f}°, '
+                f'关节2={self._sweep_joint2:.0f}°')
             self._ik_failed = False
             self._state = 'CENTERING'
             self._center_attempts = 0
@@ -502,13 +585,16 @@ class ArmCatchNode(Node):
             self._center_ang2 = math.degrees(self.current_angles[2])
             return
 
-        # 扫描到头, 反向继续
-        if self._sweep_angle >= SWEEP_MAX and self._sweep_dir == 1:
-            self._sweep_dir = -1
-            self.get_logger().info('扫描到头, 反向继续')
-        elif self._sweep_angle <= SWEEP_MIN and self._sweep_dir == -1:
-            self._sweep_dir = 1
-            self.get_logger().info('扫描到头, 反向继续')
+        # 当前扫描线扫完 → 进入下一条线; 全部扫完则失败
+        line_done = (self._sweep_dir == 1 and self._sweep_angle >= self._sweep_target) or \
+                    (self._sweep_dir == -1 and self._sweep_angle <= self._sweep_target)
+        if line_done:
+            self._sweep_line += 1
+            if self._sweep_line >= len(RASTER_LINES):
+                self._sweep_failed()
+            else:
+                self._start_sweep_line()
+            return
 
         # 步进
         if now - self._sweep_last_step < SWEEP_INTERVAL:
@@ -522,15 +608,84 @@ class ArmCatchNode(Node):
 
         self._sweep_last_step = now
 
-        # 发送关节指令: 只动 0 轴, 其他关节保持进入扫描时的基准角度
+        # 发送关节指令: 0轴扫描角 + 关节2为该线角度, 其余关节固定
         ang = list(self._sweep_base_angles)
         ang[0] = self._sweep_angle
+        ang[2] = self._sweep_joint2
         cmd = ArmJointAngles()
         cmd.angles = [math.radians(a) for a in ang] + [self.current_angles[5]]
         cmd.motion_time_ms = int(SWEEP_INTERVAL * 1000)
         self.cmd_pub.publish(cmd)
 
-        self.get_logger().info(f'扫描: 0轴={self._sweep_angle:.0f}°')
+        self.get_logger().info(
+            f'扫描: 0轴={self._sweep_angle:.0f}°, 关节2={self._sweep_joint2:.0f}°')
+
+    def _resume_sweeping_after_invalid(self, reason: str):
+        """无效目标(超出工作范围等无法调整) → 忽略该目标, 0轴从当前位置继续扫描, 关节2不变"""
+        self.get_logger().warn(
+            f'{reason}, 忽略该目标: 关节2保持 {self._sweep_joint2:.0f}°, 0轴继续扫描')
+        self._state = 'SWEEPING'
+        self._idle_no_ball_time = 0.0
+        # 显式恢复扫描基准姿态, 避免依赖旧值 (IDLE 直接检测到球时可能还是全0)
+        self._sweep_base_angles = [0.0, 0.0, -3.0, -91.0, 0.0]
+        # 0轴从当前位置继续按原方向扫, 不回起点 (避免当前扫描线内再次扫到同一无效目标)
+        self._sweep_angle = math.degrees(self.current_angles[0])
+        self._sweep_last_step = 0.0
+        # 短暂忽略球检测, 让机械臂转过当前目标 (居中后球位于画面中心)
+        self._sweep_ignore_until = time.time() + INVALID_RESUME_IGNORE
+        # 立即发送继续扫描指令 (0轴当前角 + 关节2不变)
+        ang = list(self._sweep_base_angles)
+        ang[0] = self._sweep_angle
+        ang[2] = self._sweep_joint2
+        cmd = ArmJointAngles()
+        cmd.angles = [math.radians(a) for a in ang] + [self.current_angles[5]]
+        cmd.motion_time_ms = MOTION_CENTER
+        self.cmd_pub.publish(cmd)
+
+    def _sweep_failed(self):
+        """光栅扫描 4 条线均无结果 → 机械臂归位 + 底盘倒退 20cm → 倒退完成后蜂鸣 3 次结束"""
+        self.get_logger().warn('=== 光栅扫描 4 条线均未找到球, 系统工作结束 ===')
+        # 1. 机械臂归位到恢复角度
+        cmd = ArmJointAngles()
+        cmd.angles = [math.radians(a) for a in RESET_ANGLES] + [self.current_angles[5]]
+        cmd.motion_time_ms = MOTION_RESET
+        self.cmd_pub.publish(cmd)
+        self.get_logger().info(
+            f'机械臂归位: [{", ".join(f"{a:+.0f}" for a in RESET_ANGLES)}]°')
+        # 2. 请求底盘倒退 20cm (与归位同时进行)
+        msg = Float32()
+        msg.data = float(FINISH_BACK_OFF)
+        self.back_off_dist_pub.publish(msg)
+        self.get_logger().info(f'请求底盘倒退 {FINISH_BACK_OFF * 100:.0f}cm')
+        # 3. 进入结束等待状态
+        self._state = 'FINISHING'
+        self._finish_start_time = time.time()
+        self._finish_busy_seen = False
+
+    def _do_finishing(self):
+        """等待底盘倒退完成 → 蜂鸣 3 次 → 终态"""
+        if self._chassis_busy:
+            self._finish_busy_seen = True
+            return
+        # 底盘已停止: 观察到过倒退(完成) 或 超时 → 蜂鸣结束
+        if self._finish_busy_seen or (time.time() - self._finish_start_time > FINISH_TIMEOUT):
+            self._beep_finish()
+            self._state = 'FINISHED'
+
+    def _beep_finish(self):
+        """蜂鸣器响 3 次"""
+        if not self._beep_ok:
+            self.get_logger().warn('蜂鸣器不可用, 跳过鸣响')
+            return
+        try:
+            for _ in range(BEEP_TIMES):
+                GPIO.output(BEEP_PIN, 1)
+                time.sleep(BEEP_ON_S)
+                GPIO.output(BEEP_PIN, 0)
+                time.sleep(BEEP_OFF_S)
+            self.get_logger().info('蜂鸣器鸣响 3 次完成')
+        except Exception as e:
+            self.get_logger().warn(f'蜂鸣器鸣响失败: {e}')
 
     def _do_solving(self):
         """求解阶段: 请求 /get_goal → IK"""
@@ -565,18 +720,42 @@ class ArmCatchNode(Node):
 
         self._last_target = np.array([resp.goal.x, resp.goal.y, resp.goal.z])
         target = self._last_target.copy()
+        raw_z = float(target[2])  # 原始识别 z, 用于 y 补偿判断
 
         # 检查工作范围 (半球形: 水平径向 + z 随 r 收缩), 用原始 z (不含补偿)
+        z = target[2]
+        # 1) z 过高 (球太高) → 底盘无法调整高度 → 忽略目标继续扫描
+        if z > WORKSPACE['z_max']:
+            self._ik_busy = False
+            self._resume_sweeping_after_invalid(
+                f'目标 z 过高: [{target[0]*100:.0f}, {target[1]*100:.0f}, {z*100:.0f}] cm '
+                f'(上限 {WORKSPACE["z_max"]*100:.0f}cm)'
+            )
+            return
+        # 2) z 过低 (球太低) → 强制夹到最低可达高度 z_min, 不忽略目标, 继续 IK
+        if z < WORKSPACE['z_min']:
+            self.get_logger().warn(
+                f'目标 z 过低 ({z*100:.1f}cm), 强制夹到最低可达高度 {WORKSPACE["z_min"]*100:.0f}cm')
+            z = WORKSPACE['z_min']
+            target[2] = z
+        # 3) 水平距离太远 (半球几何超) → 底盘前进可解决 → 调整底盘
         if not self._in_workspace(target[0], target[1], target[2]):
             self._ik_busy = False
             r = math.sqrt(target[0] ** 2 + target[1] ** 2)
             self._fail(
-                f'目标超出工作范围: [{target[0]*100:.0f}, {target[1]*100:.0f}, {target[2]*100:.0f}] cm (r={r*100:.0f}cm)'
+                f'目标水平距离太远: [{target[0]*100:.0f}, {target[1]*100:.0f}, {z*100:.0f}] cm '
+                f'(r={r*100:.0f}cm)'
             )
             return
 
-        # 抓取目标 z 加分段补偿 (只影响 IK 解算目标, 不影响上面的范围判断)
+        # 抓取目标 z 分段补偿 (只影响 IK 解算目标, 不影响上面的范围判断)
         target[2] = self._apply_z_comp(target[2])
+
+        # 原始识别 z < 0 时, 末端 y 额外补偿 -2cm (只影响末端夹取位置, 不触发底盘调整, 不影响视觉)
+        if raw_z < 0.0:
+            target[1] -= 0.02
+            self.get_logger().info(
+                f'原始 z={raw_z*100:.1f}cm < 0, 末端 y 补偿 -2cm (仅影响抓取位置)')
 
         q_start = [float(a) for a in self.current_angles[:5]]
         self.get_logger().info(
@@ -709,10 +888,39 @@ class ArmCatchNode(Node):
         """等待夹爪夹紧"""
         if time.time() - self._state_start_time < GRIPPER_CATCH_WAIT:
             return
-        self.get_logger().info('✅ GRASPING_WAIT 完成 → 移动到放置位置')
-        self._state = 'PLACING'
-        self._state_start_time = time.time()
+        self.get_logger().info('✅ GRASPING_WAIT 完成 → 轴5 左右转 90°')
+        self._state = 'SHAKING'
+        self._shake_step = 0
         self._cmd_sent = False
+
+    def _do_shaking(self):
+        """抓取合爪后腕部(joint5, index4)左右转 90°: 从当前位→-90°→+90°→0°(绝对), 完成后进入放置"""
+        if not self._cmd_sent:
+            ang_deg = SHAKE_ANGLES[self._shake_step]
+            cmd = ArmJointAngles()
+            # 前4轴(index0-3)与夹爪(index5)保持不变, 只转 index4
+            cmd.angles = [float(a) for a in self.current_angles[:4]] + \
+                         [math.radians(ang_deg), float(self.current_angles[5])]
+            cmd.motion_time_ms = MOTION_SHAKE
+            self.cmd_pub.publish(cmd)
+            self._cmd_sent = True
+            self._state_start_time = time.time()
+            self.get_logger().info(
+                f'轴5(index4) 转到 {ang_deg:+.0f}° | 等待 {MOTION_SHAKE}ms')
+            return
+
+        if time.time() - self._state_start_time < MOTION_SHAKE / 1000.0:
+            return
+
+        # 当前步完成, 进入下一步
+        self._shake_step += 1
+        if self._shake_step >= len(SHAKE_ANGLES):
+            self.get_logger().info('✅ 轴5 左右转 90° 完成 → 移动到放置位置')
+            self._state = 'PLACING'
+            self._state_start_time = time.time()
+            self._cmd_sent = False
+        else:
+            self._cmd_sent = False
 
     def _do_placing(self):
         """发送放置指令，等待固件 MOTION_PLACE 时间完成后打开夹爪"""

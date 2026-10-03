@@ -1,4 +1,4 @@
-# 编译产物 (ROS2 colcon)
+# colcon 构建产物
 build/
 install/
 log/
@@ -6,13 +6,8 @@ log/
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
 *.egg-info/
-.eggs/
+*.egg-link
 
-# 编辑器 / 临时文件
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
+# 其他
+.DS_Store
